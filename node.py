@@ -14,9 +14,9 @@ import rpc_tools  # Imports shared RPC proxy/server helpers
 # Update these IPs to your Google Cloud node's internal or external IPs.
 # For testing on one machine, you can use 'localhost'.
 PEERS_CONFIG = {  # Static mapping of node identifiers to network endpoints
-    1: ('localhost', 17001),  # Node 1 bound address
-    2: ('localhost', 17002),  # Node 2 bound address
-    3: ('localhost', 17003),  # Node 3 bound address
+    1: ('10.128.0.3', 17001),  # Node 1 bound address
+    2: ('10.128.0.4', 17002),  # Node 2 bound address
+    3: ('10.128.0.6', 17003),  # Node 3 bound address
 }
 AUTHKEY = b'paxos_lab_secret'  # Shared authentication token for all IPC connections
 MAJORITY = 2  # Majority threshold for a three-node cluster [cite: 6]

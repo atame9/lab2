@@ -10,9 +10,9 @@ import rpc_tools  # Imports shared RPC helper utilities
 # !! IMPORTANT !!
 # This config must match the one in node.py
 PEERS_CONFIG = {  # Maps node IDs to (host, port) tuples for each Paxos node
-    1: ('localhost', 17001),  # Node 1 address
-    2: ('localhost', 17002),  # Node 2 address
-    3: ('localhost', 17003),  # Node 3 address
+    1: ('10.128.0.3', 17001),  # Node 1 address
+    2: ('10.128.0.4', 17002),  # Node 2 address
+    3: ('10.128.0.6', 17003),  # Node 3 address
 }
 AUTHKEY = b'paxos_lab_secret'  # Shared authentication token for all RPC connections
 
