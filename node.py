@@ -1,386 +1,385 @@
-"""Combined proposer/acceptor node for the Paxos lab."""
+"""Paxos node implementing proposer and acceptor roles (NO learners)."""
 
-import json  # Handles persistence of acceptor state
-import os  # Provides filesystem utilities for persistence checks
-import sys  # Access to command-line arguments for node ID selection
-import threading  # Provides threads for background peer connections
-import time  # Supplies sleep for retry/backoff windows
-import random  # Generates randomized delays to simulate timing races
-from multiprocessing.connection import Client  # Establishes authenticated IPC channels
-import rpc_tools  # Imports shared RPC proxy/server helpers
+import json
+import os
+import sys
+import threading
+import time
+import random
+from multiprocessing.connection import Client
+import rpc_tools
 
-# --- CONFIGURATION ---
-# !! IMPORTANT !!
-# Update these IPs to your Google Cloud node's internal or external IPs.
-# For testing on one machine, you can use 'localhost'.
-PEERS_CONFIG = {  # Static mapping of node identifiers to network endpoints
-    1: ('10.128.0.3', 17001),  # Node 1 bound address
-    2: ('10.128.0.4', 17002),  # Node 2 bound address
-    3: ('10.128.0.6', 17003),  # Node 3 bound address
+# Configuration - must match client.py
+PEERS_CONFIG = {
+    1: ('10.128.0.3', 17001),
+    2: ('10.128.0.4', 17002),
+    3: ('10.128.0.6', 17003),
 }
-AUTHKEY = b'paxos_lab_secret'  # Shared authentication token for all IPC connections
-MAJORITY = 2  # Majority threshold for a three-node cluster [cite: 6]
-# --- END CONFIGURATION ---
+AUTHKEY = b'paxos_lab_secret'
+MAJORITY = len(PEERS_CONFIG) // 2 + 1  # 2 out of 3 nodes
+
+# Retry configuration for livelock prevention (Bonus-2)
+MAX_RETRIES = 10       # Maximum number of retry attempts
+MIN_BACKOFF = 0.1      # Minimum backoff time (seconds)
+MAX_BACKOFF = 5.0      # Maximum backoff time (seconds)
 
 
-class PaxosNode:  # Encapsulates proposer, acceptor, and learner behavior for one node
-    """
-    Implements a Paxos node that is both a Proposer and an Acceptor. [cite: 13]
-    Based on the "Single Decree Paxos: Protocol" slide (image_82e57d.png).
-    """
+class PaxosNode:
+    """Paxos node acting as both proposer and acceptor."""
 
-    def __init__(self, node_id):  # Initialize all role-specific state for this node
-        self.node_id = node_id  # Numeric identifier for this node instance
-        self.address = PEERS_CONFIG[node_id]  # Lookup local (host, port) tuple
-        self.peers = {}  # Holds RPC proxies to each connected peer {peer_id: proxy}
-        self.lock = threading.Lock()  # Serializes access to shared Paxos state
+    def __init__(self, node_id):
+        self.node_id = node_id
+        self.address = PEERS_CONFIG[node_id]
+        self.peers = {}  # Connected peer nodes {peer_id: proxy}
+        self.lock = threading.Lock()  # Protects shared state access
 
-        # File to store the chosen value [cite: 10, 15]
-        self.storage_file = f"CISC5597_node_{self.node_id}.txt"  # Per-node storage path
-        # File to persist acceptor metadata for crash recovery
-        self.state_file = f"CISC5597_node_{self.node_id}_state.json"
+        # File paths for persistence
+        self.storage_file = f"CISC5597_node_{node_id}.txt"  # Where value is stored
+        self.state_file = f"CISC5597_node_{node_id}_state.json"  # Paxos state
 
-        # --- Paxos Acceptor State ---
-        # (Must be persistent, per slide)
-        self.promised_id = (-1, -1)     # Highest proposal ID promised during Prepare
-        self.accepted_id = (-1, -1)     # Highest proposal ID accepted in Phase 2
-        self.accepted_value = None      # Value that corresponds to accepted_id
+        # Acceptor state (must be persistent per Paxos requirements)
+        self.promised_id = (-1, -1)      # Highest proposal ID promised to
+        self.accepted_id = (-1, -1)      # Highest proposal ID accepted
+        self.accepted_value = None       # Value corresponding to accepted_id
 
-        # --- Paxos Proposer State ---
-        self.proposal_counter = 0       # Local counter for generating unique proposal IDs
+        # Proposer state (persistent to avoid reusing proposal IDs after crash)
+        self.proposal_counter = 0        # Counter for generating unique proposal IDs
 
-        # Final chosen value
-        self.chosen_value = None  # Learner-visible committed value
-        self._load_persistent_state()  # Restore previously persisted state, if any
-        print(f"Node {self.node_id} initialized.")  # Log initialization summary
-        print(f"  > Acceptor state: promised_id={self.promised_id}, accepted_id={self.accepted_id}")  # Show acceptor state
-        print(f"  > Current learned value: {self.chosen_value}")  # Display restored learner value
-        print(f"  > Storage file: {self.storage_file}")  # Indicate backing file location
+        # Current file value (written when value is accepted)
+        self.file_value = None
 
-    def _write_to_file(self, value):  # Persist the current chosen value to disk
-        """Helper to write the chosen value to the replicated file."""
-        try:
-            with open(self.storage_file, 'w') as f:  # Open file for overwrite
-                f.write(str(value) if value is not None else "")  # Persist stringified value or blank placeholder
-        except Exception as e:
-            print(f"[ERROR] Node {self.node_id} failed to write to file: {e}")  # Report I/O failures
+        self._load_state()  # Restore state from disk if exists
+        print(f"Node {node_id} initialized. File value: {self.file_value}")
 
-    def _persist_acceptor_state(self):  # Store acceptor metadata for crash recovery
-        state_payload = {
-            "promised_id": list(self.promised_id),
-            "accepted_id": list(self.accepted_id),
-            "accepted_value": self.accepted_value,
-        }
-        try:
-            with open(self.state_file, 'w') as f:
-                json.dump(state_payload, f)
-        except Exception as e:
-            print(f"[ERROR] Node {self.node_id} failed to write acceptor state file: {e}")
+    # ========================================================================
+    # Persistence
+    # ========================================================================
 
-    def _load_persistent_state(self):  # Restore learner and acceptor state from disk when available
-        # Recover previously chosen value
+    def _load_state(self):
+        """Load persistent state from disk."""
+        # Load file value from storage file
         if os.path.exists(self.storage_file):
             try:
                 with open(self.storage_file, 'r') as f:
                     data = f.read()
-                self.chosen_value = data if data != "" else None
+                self.file_value = data if data else None
             except Exception as e:
-                print(f"[ERROR] Node {self.node_id} failed to read storage file: {e}")
+                print(f"[ERROR] Failed to read storage file: {e}")
         else:
-            # Ensure file exists for future writes
-            try:
-                with open(self.storage_file, 'w'):
-                    pass
-            except Exception as e:
-                print(f"[ERROR] Node {self.node_id} failed to create storage file: {e}")
+            open(self.storage_file, 'w').close()  # Create empty file
 
-        # Recover acceptor state if previously persisted
+        # Load acceptor state from JSON file
         if os.path.exists(self.state_file):
             try:
                 with open(self.state_file, 'r') as f:
                     state = json.load(f)
-                promised_raw = state.get("promised_id", [-1, -1])
-                accepted_raw = state.get("accepted_id", [-1, -1])
-                self.promised_id = tuple(promised_raw) if promised_raw is not None else (-1, -1)
-                self.accepted_id = tuple(accepted_raw) if accepted_raw is not None else (-1, -1)
+                # Restore acceptor state
+                self.promised_id = tuple(state.get("promised_id", [-1, -1]))
+                self.accepted_id = tuple(state.get("accepted_id", [-1, -1]))
                 self.accepted_value = state.get("accepted_value")
+                # Restore proposer counter (important to avoid reusing IDs)
+                self.proposal_counter = state.get("proposal_counter", 0)
             except Exception as e:
-                print(f"[ERROR] Node {self.node_id} failed to read acceptor state file: {e}")
+                print(f"[ERROR] Failed to read state file: {e}")
         else:
-            # Persist default state so subsequent updates have a file to overwrite
-            self._persist_acceptor_state()
+            self._persist_state()  # Create initial state file
 
-    def connect_to_peers(self):  # Establish outbound connections to every other node
-        """
-        Attempts to connect to all other nodes in the PEERS_CONFIG.
-        This runs in a separate thread. [cite: 9, 35]
-        """
-        print(f"Node {self.node_id}: Attempting to connect to peers...")  # Announce connection attempts
-        for peer_id, addr in PEERS_CONFIG.items():  # Iterate over every configured node
-            if peer_id == self.node_id:  # Skip self to avoid self-connection
-                continue  # Move to the next peer entry
+    def _persist_state(self):
+        """Persist acceptor and proposer state to disk."""
+        state = {
+            "promised_id": list(self.promised_id),
+            "accepted_id": list(self.accepted_id),
+            "accepted_value": self.accepted_value,
+            "proposal_counter": self.proposal_counter,  # Persisted to avoid ID reuse
+        }
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f)
+        except Exception as e:
+            print(f"[ERROR] Failed to persist state: {e}")
 
-            while peer_id not in self.peers:  # Loop until connection succeeds
+    def _write_to_file(self, value):
+        """Write value to file after successful consensus."""
+        try:
+            with open(self.storage_file, 'w') as f:
+                f.write(str(value) if value else "")
+            self.file_value = value  # Update in-memory copy
+        except Exception as e:
+            print(f"[ERROR] Failed to write to file: {e}")
+
+    # ========================================================================
+    # Networking
+    # ========================================================================
+
+    def connect_to_peers(self):
+        """Connect to all other nodes in the cluster."""
+        print(f"Node {self.node_id}: Connecting to peers...")
+        for peer_id, addr in PEERS_CONFIG.items():
+            if peer_id == self.node_id:
+                continue  # Don't connect to self
+            
+            # Keep trying to connect until successful
+            while peer_id not in self.peers:
                 try:
-                    conn = Client(addr, authkey=AUTHKEY)  # Establish authenticated connection to peer
-                    self.peers[peer_id] = rpc_tools.RPCProxy(conn)  # Retain proxy for future RPC calls
-                    print(f"Node {self.node_id}: Connected to peer {peer_id} at {addr}")  # Confirm success
+                    conn = Client(addr, authkey=AUTHKEY)
+                    self.peers[peer_id] = rpc_tools.RPCProxy(conn)
+                    print(f"Node {self.node_id}: Connected to peer {peer_id}")
                 except Exception:
-                    time.sleep(3)  # Wait before retrying to reduce spam
-        print(f"\n--- Node {self.node_id}: All peers connected! ---\n")  # Indicate readiness
+                    time.sleep(3)  # Wait before retrying
+        
+        print(f"--- Node {self.node_id}: All peers connected! ---\n")
 
-    # --- Acceptor RPC Functions ---
-
-    def rpc_prepare(self, proposal_id):  # Handle incoming Phase 1 prepare requests
-        """
-        Acceptor logic for Phase 1 (Prepare).
-        Corresponds to step 3 on the protocol slide.
-        """
-        with self.lock:  # Guard state updates
-            if proposal_id > self.promised_id:  # Only promise higher proposal IDs
-                self.promised_id = proposal_id  # Record newest promise
-                self._persist_acceptor_state()  # Persist promise so restart keeps safety guarantees
-                print(f"  [ACCEPTOR {self.node_id}] PROMISE: New proposal {proposal_id}. Promising.")  # Log promise event
-                # Return promise, and any previously accepted value
-                return {
-                    "status": "promise",  # Indicates success
-                    "promised_id": self.promised_id,  # Report latest promise ID
-                    "accepted_id": self.accepted_id,  # Share prior accepted proposal ID
-                    "accepted_value": self.accepted_value  # Share prior accepted value
-                }
-            else:
-                print(f"  [ACCEPTOR {self.node_id}] REJECT: Proposal {proposal_id} is <= promised {self.promised_id}.")  # Log rejection
-                # Return rejection
-                return {
-                    "status": "reject",  # Signal failure to caller
-                    "promised_id": self.promised_id  # Communicate current promise threshold
-                }
-
-    def rpc_accept(self, proposal_id, value):  # Handle incoming Phase 2 accept requests
-        """
-        Acceptor logic for Phase 2 (Accept).
-        Corresponds to step 6 on the protocol slide.
-        """
-        with self.lock:  # Ensure atomic comparison and update
-            if proposal_id >= self.promised_id:  # Accept if proposal matches/ exceeds promise
-                self.promised_id = proposal_id  # Upgrade promise to accepted proposal
-                self.accepted_id = proposal_id  # Persist accepted proposal ID
-                self.accepted_value = value  # Persist associated value
-                self._persist_acceptor_state()  # Persist acceptor state for crash recovery
-                print(f"  [ACCEPTOR {self.node_id}] ACCEPTED: Proposal {proposal_id} with value '{value}'.")  # Log acceptance
-                # Return accepted
-                return {
-                    "status": "accepted",  # Notify proposer of success
-                    "promised_id": self.promised_id  # Share current promise floor
-                }
-            else:
-                print(f"  [ACCEPTOR {self.node_id}] REJECT: Proposal {proposal_id} is < promised {self.promised_id}.")  # Explain rejection
-                # Return rejection
-                return {
-                    "status": "reject",  # Notify proposer of failure
-                    "promised_id": self.promised_id  # Provide latest promise threshold
-                }
-
-    def rpc_get_file_content(self):  # Allow clients to read the chosen value
-        """Client RPC to check the final chosen value."""
-        with self.lock:  # Ensure consistent read of learner state
-            return self.chosen_value  # Return locally learned value (could be None)
-
-    def rpc_reset_state(self):  # Reset node to initial state for testing
-        """Reset this node to initial state (for testing scenarios)."""
-        with self.lock:
-            print(f"[RESET] Node {self.node_id} resetting state...")
-            
-            # Reset Paxos state
-            self.promised_id = (-1, -1)
-            self.accepted_id = (-1, -1)
-            self.accepted_value = None
-            self.proposal_counter = 0
-            self.chosen_value = None
-            
-            # Clear storage files
+    def _broadcast_rpc(self, method_name, *args):
+        """Broadcast RPC call to all peers and self."""
+        responses = {}
+        
+        # Call all peer nodes
+        for peer_id, proxy in self.peers.items():
             try:
-                with open(self.storage_file, 'w') as f:
-                    f.write("")
-                self._persist_acceptor_state()
-                print(f"[RESET] Node {self.node_id} state cleared successfully")
-                return {"status": "success"}
+                responses[peer_id] = getattr(proxy, method_name)(*args)
             except Exception as e:
-                print(f"[RESET ERROR] Node {self.node_id}: {e}")
-                return {"status": "error", "message": str(e)}
-
-    # --- Proposer RPC Function (Client-facing) ---
-
-    def rpc_submit_value(self, value, scenario_delay=0):  # Client-facing entry point for proposals
-        """
-        Client submits a value. This node becomes a Proposer. [cite: 16, 17]
-        This implements the Proposer logic (steps 1, 2, 4, 5, 7) with retry logic.
+                print(f"[ERROR] RPC {method_name} to {peer_id} failed: {e}")
+                responses[peer_id] = None  # Mark as failed
         
-        (Bonus-2) Implements randomized restart for livelock prevention:
-        - If proposal fails, retry with exponential backoff
-        - Random jitter breaks symmetry between competing proposers
-        """
-
-        # Add a random delay to simulate network/processing differences [cite: 28, 30]
-        print(f"\n[PROPOSER {self.node_id}] Received submit request for '{value}' with delay {scenario_delay}s")
-        time.sleep(scenario_delay)  # Honor scripted scenario delay
-
-        # (Bonus-2) Retry loop with randomized backoff for livelock prevention
-        MAX_RETRIES = 10
-        MIN_BACKOFF = 0.1
-        MAX_BACKOFF = 5.0
+        # Call self locally (no network needed)
+        try:
+            responses[self.node_id] = getattr(self, method_name)(*args)
+        except Exception as e:
+            print(f"[ERROR] Local {method_name} failed: {e}")
+            responses[self.node_id] = None
         
-        for attempt in range(MAX_RETRIES):
-            # (Bonus-2) Randomized delay before each attempt
+        return responses
+
+    # ========================================================================
+    # Acceptor RPCs (Phase 1 & 2)
+    # ========================================================================
+
+    def rpc_prepare(self, proposal_id):
+        """Phase 1: Acceptor responds to PREPARE request."""
+        with self.lock:  # Ensure atomic state check and update
+            # Only promise if proposal_id is higher than any previously promised
+            if proposal_id > self.promised_id:
+                self.promised_id = proposal_id  # Update promise
+                self._persist_state()  # Persist promise to survive crashes
+                print(f"  [ACCEPTOR {self.node_id}] PROMISE: {proposal_id}")
+                
+                # Return promise with any previously accepted value
+                return {
+                    "status": "promise",
+                    "promised_id": self.promised_id,
+                    "accepted_id": self.accepted_id,      # Return for value adoption
+                    "accepted_value": self.accepted_value  # Return for value adoption
+                }
+            else:
+                # Reject because we already promised to higher proposal
+                print(f"  [ACCEPTOR {self.node_id}] REJECT: {proposal_id} <= {self.promised_id}")
+                return {
+                    "status": "reject",
+                    "promised_id": self.promised_id  # Tell proposer what we promised
+                }
+
+    def rpc_accept(self, proposal_id, value):
+        """Phase 2: Acceptor responds to ACCEPT request."""
+        with self.lock:  # Ensure atomic state check and update
+            # Accept if proposal_id >= promised_id
+            if proposal_id >= self.promised_id:
+                # Update acceptor state
+                self.promised_id = proposal_id
+                self.accepted_id = proposal_id
+                self.accepted_value = value
+                self._persist_state()  # Persist acceptance to survive crashes
+                
+                # Write to file immediately upon accepting (no learner phase)
+                if self.file_value is None:
+                    self._write_to_file(value)
+                    print(f"  [ACCEPTOR {self.node_id}] ACCEPTED: {proposal_id} = '{value}' (wrote to file)")
+                else:
+                    print(f"  [ACCEPTOR {self.node_id}] ACCEPTED: {proposal_id} = '{value}'")
+                
+                return {
+                    "status": "accepted",
+                    "promised_id": self.promised_id
+                }
+            else:
+                # Reject because proposal_id < promised_id
+                print(f"  [ACCEPTOR {self.node_id}] REJECT: {proposal_id} < {self.promised_id}")
+                return {
+                    "status": "reject",
+                    "promised_id": self.promised_id
+                }
+
+    # ========================================================================
+    # Proposer RPC (Main Entry Point)
+    # ========================================================================
+
+    def rpc_submit_value(self, value, scenario_delay=0, enable_retry=False):
+        """
+        Proposer entry point: propose a value using Paxos consensus.
+        
+        Args:
+            value: Value to propose
+            scenario_delay: Initial delay (for test scenarios)
+            enable_retry: If True, retry on failure with exponential backoff (Bonus-2)
+        """
+        print(f"\n[PROPOSER {self.node_id}] Submit request: '{value}' (delay {scenario_delay}s)")
+        time.sleep(scenario_delay)  # Honor test scenario delay
+
+        # Determine max attempts based on retry flag
+        max_attempts = MAX_RETRIES if enable_retry else 1
+        
+        for attempt in range(max_attempts):
+            # Apply jitter and backoff for livelock prevention
             if attempt == 0:
                 # Initial jitter to break symmetry
                 jitter = random.uniform(0, 0.1)
                 time.sleep(jitter)
-                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{MAX_RETRIES} (initial jitter: {jitter:.3f}s)")
+                if enable_retry:
+                    print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{max_attempts} (jitter: {jitter:.3f}s)")
             else:
-                # Exponential backoff with randomization on retry
+                # Exponential backoff with randomization
                 backoff = min(MIN_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
-                backoff_with_jitter = backoff * random.uniform(0.5, 1.5)
-                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{MAX_RETRIES} after {backoff_with_jitter:.3f}s backoff")
-                time.sleep(backoff_with_jitter)
+                backoff *= random.uniform(0.5, 1.5)  # Add randomness
+                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{max_attempts} (backoff: {backoff:.3f}s)")
+                time.sleep(backoff)
 
-            # --- Step 1: Choose new proposal number n ---
-            with self.lock:
-                self.proposal_counter += 1
-                proposal_id = (self.proposal_counter, self.node_id)
+            # Try to achieve consensus
+            result = self._try_consensus(value, enable_retry)
+            
+            if result["status"] == "success":
+                if enable_retry:
+                    result["attempts"] = attempt + 1  # Include attempt count
+                return result
+            
+            # Retry if enabled and not last attempt
+            if enable_retry and attempt < max_attempts - 1:
+                print(f"[PROPOSER {self.node_id}] Will retry...")
+            else:
+                return result  # Give up
+        
+        return {"status": "fail", "reason": "max_retries_exceeded"}
 
-            print(f"[PROPOSER {self.node_id}] Starting Phase 1 (PREPARE) with ID {proposal_id}")
+    def _try_consensus(self, value, enable_retry):
+        """Attempt one round of Paxos consensus."""
+        # Generate new unique proposal ID: (counter, node_id)
+        with self.lock:
+            self.proposal_counter += 1
+            proposal_id = (self.proposal_counter, self.node_id)
+        
+        print(f"[PROPOSER {self.node_id}] Phase 1 PREPARE: {proposal_id}")
+        
+        # Phase 1: PREPARE - ask acceptors to promise
+        responses = self._broadcast_rpc('rpc_prepare', proposal_id)
+        promises = [r for r in responses.values() if r and r.get('status') == 'promise']
+        
+        # Check if we got majority of promises
+        if len(promises) < MAJORITY:
+            print(f"[PROPOSER {self.node_id}] Phase 1 FAILED: {len(promises)}/{MAJORITY} promises")
+            return {"status": "fail", "reason": "prepare_rejected", "proposal_id": proposal_id}
+        
+        print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: {len(promises)} promises")
+        
+        # Adopt highest accepted value if any (for safety)
+        value_to_propose = value
+        highest_accepted_id = (-1, -1)
+        for res in promises:
+            # Check if this acceptor has accepted a value
+            if res['accepted_id'] > highest_accepted_id:
+                highest_accepted_id = res['accepted_id']
+                value_to_propose = res['accepted_value']  # Must propose this value
+        
+        # Log if we're adopting a different value
+        if value_to_propose != value:
+            print(f"[PROPOSER {self.node_id}] Adopting value '{value_to_propose}' from {highest_accepted_id}")
+        
+        # Phase 2: ACCEPT - ask acceptors to accept value
+        print(f"[PROPOSER {self.node_id}] Phase 2 ACCEPT: {proposal_id} = '{value_to_propose}'")
+        responses = self._broadcast_rpc('rpc_accept', proposal_id, value_to_propose)
+        accepts = [r for r in responses.values() if r and r.get('status') == 'accepted']
+        
+        # Check if we got majority of accepts
+        if len(accepts) < MAJORITY:
+            print(f"[PROPOSER {self.node_id}] Phase 2 FAILED: {len(accepts)}/{MAJORITY} accepts")
+            return {"status": "fail", "reason": "accept_rejected", "proposal_id": proposal_id}
+        
+        # Success! Value is chosen by consensus
+        print(f"[PROPOSER {self.node_id}] Phase 2 SUCCESS: '{value_to_propose}' is CHOSEN")
+        
+        return {"status": "success", "value": value_to_propose}
 
-            # --- Step 2: Broadcast Prepare(n) to all servers ---
-            responses = self._broadcast_rpc('rpc_prepare', proposal_id)
+    # ========================================================================
+    # Utility RPCs
+    # ========================================================================
 
-            # --- Step 4: When responses received from majority ---
-            promises = [r for r in responses.values() if r and r.get('status') == 'promise']
+    def rpc_get_file_content(self):
+        """Get the current file value."""
+        with self.lock:
+            return self.file_value
 
-            if len(promises) < MAJORITY:
-                print(f"[PROPOSER {self.node_id}] Phase 1 FAILED: Not enough promises ({len(promises)}/{MAJORITY}).")
-                if attempt < MAX_RETRIES - 1:
-                    print(f"[PROPOSER {self.node_id}] Will retry with new proposal ID...")
-                    continue  # Retry with new proposal ID
-                else:
-                    print(f"[PROPOSER {self.node_id}] Max retries reached. Giving up.")
-                    return {"status": "fail", "reason": "prepare_rejected", "proposal_id": proposal_id, "attempts": attempt + 1}
-
-            print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: Got {len(promises)} promises.")
-
-            # --- Step 4 logic: Check for accepted values ---
-            highest_accepted_id = (-1, -1)
-            value_to_propose = value
-
-            for res in promises:
-                if res['accepted_id'] > highest_accepted_id:
-                    highest_accepted_id = res['accepted_id']
-                    value_to_propose = res['accepted_value']
-
-            if value_to_propose != value:
-                print(f"[PROPOSER {self.node_id}] Previous value '{value_to_propose}' (ID {highest_accepted_id}) found. Must propose it.")
-
-            # --- Step 5: Broadcast Accept(n, value) to all servers ---
-            print(f"[PROPOSER {self.node_id}] Starting Phase 2 (ACCEPT) with ID {proposal_id} and value '{value_to_propose}'")
-            responses = self._broadcast_rpc('rpc_accept', proposal_id, value_to_propose)
-
-            # --- Step 7: When responses received from majority ---
-            accepts = [r for r in responses.values() if r and r.get('status') == 'accepted']
-
-            if len(accepts) < MAJORITY:
-                print(f"[PROPOSER {self.node_id}] Phase 2 FAILED: Not enough accepts ({len(accepts)}/{MAJORITY}).")
-                if attempt < MAX_RETRIES - 1:
-                    print(f"[PROPOSER {self.node_id}] Will retry with new proposal ID...")
-                    continue  # Retry with new proposal ID
-                else:
-                    print(f"[PROPOSER {self.node_id}] Max retries reached. Giving up.")
-                    return {"status": "fail", "reason": "accept_rejected", "proposal_id": proposal_id, "attempts": attempt + 1}
-
-            # --- SUCCESS! Value is chosen ---
-            print(f"[PROPOSER {self.node_id}] Phase 2 SUCCESS: Value '{value_to_propose}' is CHOSEN after {attempt + 1} attempt(s).")
-
-            # Inform all nodes (acting as Learners) of the final value
-            self._broadcast_rpc('rpc_learn_chosen_value', value_to_propose)
-
-            return {"status": "success", "value": value_to_propose, "attempts": attempt + 1}
-
-        # Should never reach here, but just in case
-        return {"status": "fail", "reason": "max_retries_exceeded", "attempts": MAX_RETRIES}
-
-    def rpc_learn_chosen_value(self, value):  # Learner hook invoked once consensus succeeds
-        """
-        This is our simple "Learner" logic. When a Proposer succeeds,
-        it tells everyone what the value is.
-        """
-        with self.lock:  # Synchronize learner updates
-            if self.chosen_value is None:  # Only learn once
-                self.chosen_value = value  # Record chosen value
-                self._write_to_file(value)  # Persist to disk
-                self._persist_acceptor_state()  # Ensure persisted metadata reflects final value
-                print(f"  [LEARNER {self.node_id}] Learned CHOSEN value: '{value}'. Wrote to file.")  # Log learn event
-        return True  # Return success to caller
-
-    def _broadcast_rpc(self, func_name, *args):  # Fan out RPC call to peers and local instance
-        """Helper to send an RPC to all peers and self."""
-        responses = {}  # Collect response payloads keyed by node ID
-
-        # Call peers
-        for peer_id, proxy in self.peers.items():  # Iterate through connected proxies
+    def rpc_reset_state(self):
+        """Reset node to initial state (for testing)."""
+        with self.lock:
+            print(f"[RESET] Node {self.node_id} resetting...")
+            # Reset all state to initial values
+            self.promised_id = (-1, -1)
+            self.accepted_id = (-1, -1)
+            self.accepted_value = None
+            self.proposal_counter = 0
+            self.file_value = None
+            
             try:
-                responses[peer_id] = getattr(proxy, func_name)(*args)  # Dispatch remote RPC
+                # Clear files
+                open(self.storage_file, 'w').close()
+                self._persist_state()
+                print(f"[RESET] Node {self.node_id} complete")
+                return {"status": "success"}
             except Exception as e:
-                print(f"[ERROR] RPC call {func_name} to {peer_id} failed: {e}")  # Record failure
-                responses[peer_id] = None  # Placeholder for failed call
+                print(f"[RESET ERROR] {e}")
+                return {"status": "error", "message": str(e)}
 
-        # Call self (no network needed)
-        try:
-            local_func = getattr(self, func_name)  # Resolve local handler
-            responses[self.node_id] = local_func(*args)  # Execute locally
-        except Exception as e:
-            print(f"[ERROR] Local call {func_name} failed: {e}")  # Report local failure
-            responses[self.node_id] = None  # Preserve map shape
 
-        return responses  # Return aggregated responses
-
+# ============================================================================
+# Main
+# ============================================================================
 
 def main():
-    if len(sys.argv) < 2:  # Require a node identifier argument
-        print("Usage: python node.py <node_id>")  # Provide usage instructions
-        print("Example: python node.py 1")  # Offer concrete example
-        sys.exit(1)  # Exit because arguments are missing
+    # Validate command-line arguments
+    if len(sys.argv) < 2:
+        print("Usage: python3 node.py <node_id>")
+        print("Example: python3 node.py 1")
+        sys.exit(1)
 
     try:
-        node_id = int(sys.argv[1])  # Parse node identifier
-        if node_id not in PEERS_CONFIG:  # Validate ID exists in configuration
-            raise ValueError  # Trigger error for unsupported ID
+        node_id = int(sys.argv[1])
+        if node_id not in PEERS_CONFIG:
+            raise ValueError
     except ValueError:
-        print(f"Invalid node_id. Must be one of {list(PEERS_CONFIG.keys())}")  # Report invalid ID
-        sys.exit(1)  # Abort startup
+        print(f"Invalid node_id. Must be one of {list(PEERS_CONFIG.keys())}")
+        sys.exit(1)
 
-    node = PaxosNode(node_id)  # Instantiate Paxos node with validated ID
+    # Create Paxos node
+    node = PaxosNode(node_id)
 
-    # Start a thread to connect to peers
-    peer_thread = threading.Thread(target=node.connect_to_peers)  # Prepare background connector thread
-    peer_thread.daemon = True  # Allow program to exit even if thread is running
-    peer_thread.start()  # Begin asynchronous peer connections
+    # Connect to peers in background thread
+    peer_thread = threading.Thread(target=node.connect_to_peers)
+    peer_thread.daemon = True  # Allow main to exit even if thread running
+    peer_thread.start()
 
-    # Register all RPC functions
-    handler = rpc_tools.RPCHandler()  # Create server-side dispatcher
-    handler.register_function(node.rpc_prepare)  # Expose prepare RPC endpoint
-    handler.register_function(node.rpc_accept)  # Expose accept RPC endpoint
-    handler.register_function(node.rpc_submit_value)  # Expose proposer entry point
-    handler.register_function(node.rpc_get_file_content)  # Expose file read helper
-    handler.register_function(node.rpc_learn_chosen_value)  # Expose learner notification
-    handler.register_function(node.rpc_reset_state)  # Expose reset for testing
+    # Register RPC handlers
+    handler = rpc_tools.RPCHandler()
+    handler.register_function(node.rpc_prepare)            # Phase 1 handler
+    handler.register_function(node.rpc_accept)             # Phase 2 handler
+    handler.register_function(node.rpc_submit_value)       # Proposer entry point
+    handler.register_function(node.rpc_get_file_content)   # For checking state
+    handler.register_function(node.rpc_reset_state)        # For testing
 
-    # Start the RPC server
+    # Start RPC server (blocks forever)
     try:
-        rpc_tools.rpc_server(handler, node.address, authkey=AUTHKEY)  # Launch blocking RPC listener
+        rpc_tools.rpc_server(handler, node.address, authkey=AUTHKEY)
     except KeyboardInterrupt:
-        print("\nShutting down server...")  # Gracefully exit on Ctrl+C
+        print("\nShutting down...")
     except Exception as e:
-        print(f"Server crashed: {e}")  # Report unexpected fatal error
+        print(f"Server error: {e}")
 
 
-if __name__ == "__main__":  # Only execute when run as script
-    main()  # Delegate to CLI entry point
+if __name__ == "__main__":
+    main()

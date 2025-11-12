@@ -1,14 +1,12 @@
-"""Client helper for issuing Paxos proposals and running canned scenarios."""
+"""Client for running Paxos test scenarios."""
 
-import argparse
 import sys
 import threading
 import time
 from multiprocessing.connection import Client
 import rpc_tools
 
-# !! IMPORTANT !!
-# This config must match the one in node.py
+# Configuration - must match node.py
 PEERS_CONFIG = {
     1: ('10.128.0.3', 17001),
     2: ('10.128.0.4', 17002),
@@ -17,81 +15,69 @@ PEERS_CONFIG = {
 AUTHKEY = b'paxos_lab_secret'
 
 
-def _connect(node_id):
-    """Helper to open RPC connection to single node."""
+# ============================================================================
+# Helper Functions
+# ============================================================================
+
+def _rpc_call(node_id, method_name, *args):
+    """Generic RPC call helper."""
     addr = PEERS_CONFIG[node_id]
     conn = Client(addr, authkey=AUTHKEY)
-    return rpc_tools.RPCProxy(conn), conn
-
-
-def _submit(node_id, value, delay):
-    """Issue submit RPC and print result."""
-    proxy, conn = _connect(node_id)
     try:
-        print(f"Submitting '{value}' to Node {node_id} (delay {delay}s)")
-        result = proxy.rpc_submit_value(value, delay)
-        print(f" -> {result}")
-        return result
+        proxy = rpc_tools.RPCProxy(conn)
+        return getattr(proxy, method_name)(*args)
     finally:
         conn.close()
 
 
-def _get_state(node_id):
-    """Query node state for inspection."""
-    proxy, conn = _connect(node_id)
-    try:
-        state = proxy.rpc_get_file_content()
-        print(f"Node {node_id} value: {state}")
-        return state
-    finally:
-        conn.close()
+def _submit(node_id, value, delay, enable_retry=False):
+    """Submit a value proposal to a node."""
+    print(f"Submitting '{value}' to Node {node_id} (delay {delay}s)")
+    result = _rpc_call(node_id, 'rpc_submit_value', value, delay, enable_retry)
+    print(f" -> {result}")
+    return result
 
 
 def _show_cluster_state():
-    """Print current learner values for all nodes."""
+    """Display the chosen value on all nodes."""
     print("\n=== Cluster state ===")
     for node_id in sorted(PEERS_CONFIG):
-        _get_state(node_id)
+        state = _rpc_call(node_id, 'rpc_get_file_content')
+        print(f"Node {node_id} value: {state}")
     print("=====================\n")
 
 
-def _reset_node(node_id):
-    """Reset a single node to initial state."""
-    proxy, conn = _connect(node_id)
-    try:
-        result = proxy.rpc_reset_state()
-        print(f"Node {node_id} reset: {result.get('status', 'unknown')}")
-        return result
-    finally:
-        conn.close()
-
-
 def _reset_cluster():
-    """Reset all nodes to fresh state for testing."""
+    """Reset all nodes to initial state."""
     print("\n=== Resetting cluster state ===")
     for node_id in sorted(PEERS_CONFIG):
         try:
-            _reset_node(node_id)
+            result = _rpc_call(node_id, 'rpc_reset_state')
+            print(f"Node {node_id} reset: {result.get('status', 'unknown')}")
         except Exception as e:
             print(f"Error resetting Node {node_id}: {e}")
     print("=== Reset complete ===\n")
     time.sleep(0.5)
 
 
+def _run_concurrent_proposals(proposals):
+    """Run multiple proposals concurrently using threads."""
+    threads = [threading.Thread(target=_submit, args=p) for p in proposals]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+
 # ============================================================================
-# SCENARIO IMPLEMENTATIONS (Based on Lab PDF and Slides)
+# Scenario Implementations
 # ============================================================================
 
-def run_scenario_single():
-    """
-    Requirement #4 (50%): Single proposer and success message to client
-    
-    Slide Reference: Basic Paxos with no contention
-    Expected Outcome: One proposal succeeds cleanly
-    """
+def scenario_1_single():
+    """Single proposer with no contention."""
     _reset_cluster()
     print("\n" + "="*70)
-    print("SCENARIO 1: Single Proposer (Requirement #4)")
+    print("SCENARIO 1: Single Proposer")
     print("Expected: One proposal succeeds with ValueA")
     print("="*70 + "\n")
     
@@ -100,240 +86,115 @@ def run_scenario_single():
     _show_cluster_state()
 
 
-def run_scenario_a_wins():
-    """
-    Requirement #5 (10%): A wins
-    
-    Slide Reference: Page 23 - "Previous value already chosen"
-    Timeline:
-      - A proposes ValueA, completes both phases
-      - B proposes ValueB later
-      - B sees ValueA was already chosen
-      - B adopts ValueA (not ValueB)
-    
-    Expected Outcome: Both succeed with ValueA
-    """
+def scenario_2_a_wins():
+    """Sequential proposals where first proposer completes before second starts."""
     _reset_cluster()
     print("\n" + "="*70)
-    print("SCENARIO 2: A Wins (Requirement #5 - Slide Page 23)")
-    print("Concept: Previous value already chosen")
+    print("SCENARIO 2: A Wins (Page 23 - Previous value already chosen)")
     print("Expected: A completes first, B sees A's value and adopts it")
-    print("Result: Both succeed with ValueA (not ValueB)")
     print("="*70 + "\n")
     
     _submit(1, "ValueA", 0.0)
-    time.sleep(0.5)  # Ensure A finishes completely before B starts
+    time.sleep(0.5)
     _submit(2, "ValueB", 0.0)
     time.sleep(1)
     _show_cluster_state()
 
 
-def run_scenario_b_wins_seen():
-    """
-    Requirement #6 (10%): B wins in scenario on page 24
-    
-    Slide Reference: Page 24 - "Previous value not chosen, but new proposer sees it"
-    Timeline:
-      - A proposes ValueA, gets some accepts (not yet majority/chosen)
-      - B proposes ValueB with slightly earlier timing
-      - B does Phase 1, sees that A's value was accepted on some nodes
-      - B adopts ValueA (even though B wanted ValueB)
-      - B succeeds with ValueA, A may fail due to B's higher proposal ID
-    
-    Expected Outcome: B succeeds with ValueA (adopted from A)
-    """
+def scenario_3_b_sees_a():
+    """Overlapping proposals where second proposer sees first's value."""
     _reset_cluster()
     print("\n" + "="*70)
-    print("SCENARIO 3: B Wins - Sees Previous Value (Requirement #6 - Slide Page 24)")
-    print("Concept: Previous value not chosen, but new proposer sees it")
-    print("Expected: A gets partial accepts, B sees A's value and adopts it")
-    print("Result: B succeeds with ValueA (not ValueB), A may fail")
+    print("SCENARIO 3: B Wins (Page 24 - Previous value not chosen, but B sees it)")
+    print("Expected: A starts first, B sees A's value and adopts it")
     print("="*70 + "\n")
-
-    threads = [
-        threading.Thread(target=_submit, args=(1, "ValueA", 0.1)),   # A: 100ms delay
-        threading.Thread(target=_submit, args=(2, "ValueB", 0.05)),  # B: 50ms delay (starts slightly first)
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    
+    _run_concurrent_proposals([
+        (1, "ValueA", 0.05, False),  # A starts first (50ms delay)
+        (2, "ValueB", 0.1, False),   # B starts second (100ms delay)
+    ])
     time.sleep(1)
     _show_cluster_state()
 
 
-def run_scenario_b_wins_interleaved():
-    """
-    Bonus-1 / Requirement #7 (5%): B wins in scenario on page 25
-    
-    Slide Reference: Page 25 - "Previous value not chosen, new proposer doesn't see it"
-    Timeline:
-      - A proposes ValueA, starts getting accepts
-      - B proposes ValueB almost simultaneously (true interleaving)
-      - B does Phase 1 on servers that HAVEN'T accepted A yet
-      - B doesn't see A's value (those servers have no accepted value)
-      - B proposes its own ValueB
-      - B's higher proposal ID blocks A
-      - B succeeds with ValueB
-    
-    Expected Outcome: B succeeds with ValueB (its own value), A fails
-    """
+def scenario_4_b_doesnt_see_a():
+    """True interleaving where second proposer doesn't see first's value."""
     _reset_cluster()
     print("\n" + "="*70)
-    print("SCENARIO 4: B Wins - Doesn't See Previous (Bonus-1 - Slide Page 25)")
-    print("Concept: Previous value not chosen, new proposer doesn't see it")
-    print("Expected: True interleaving, B queries servers that never saw A")
-    print("Result: B proposes ValueB (its own value), A gets blocked")
+    print("SCENARIO 4: B Wins (Page 25 - Previous value not chosen, B doesn't see it)")
+    print("Expected: True interleaving, B proposes its own value")
     print("="*70 + "\n")
     
-    threads = [
-        threading.Thread(target=_submit, args=(1, "ValueA", 0.01)),  # Very close timing
-        threading.Thread(target=_submit, args=(2, "ValueB", 0.0)),   # B starts just slightly first
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    _run_concurrent_proposals([
+        (1, "ValueA", 0.01, False),  # Very close timing
+        (2, "ValueB", 0.0, False),   # B starts slightly first
+    ])
     time.sleep(1)
     _show_cluster_state()
 
 
-def run_scenario_livelock():
-    """
-    Bonus-2 / Requirement #8 (5%): Simulate livelock and solve with randomized restart
-    
-    Slide Reference: Page 26 - "Liveness" / Livelock
-    Concept: Multiple competing proposers can livelock
-    Solution: "randomized delay before restarting"
-    
-    Timeline:
-      - Three proposers start nearly simultaneously
-      - They interfere with each other's proposals
-      - Random jitter (0-100ms) in node.py breaks the symmetry
-      - Eventually one proposal succeeds
-    
-    Note: Your code has random jitter (line 203 in node.py) but NOT retry logic.
-          True "randomized restart" would require proposals to retry after failure
-          with exponential backoff. Current implementation uses jitter to prevent
-          livelock initially, but doesn't retry on failure.
-    
-    Expected Outcome: One value chosen despite three competing proposers
-    """
+def scenario_5_livelock():
+    """Multiple competing proposers with retry to prevent livelock."""
     _reset_cluster()
     print("\n" + "="*70)
-    print("SCENARIO 5: Livelock Prevention (Bonus-2 - Slide Page 26)")
-    print("Concept: Competing proposers can livelock")
-    print("Solution: Random jitter prevents livelock")
-    print("Expected: Three proposers compete, one value eventually chosen")
-    print()
-    print("NOTE: Current implementation uses random jitter (0-100ms) to break")
-    print("      symmetry, but does NOT have retry logic. True 'randomized restart'")
-    print("      would require failed proposals to retry with random backoff.")
+    print("SCENARIO 5: Livelock Prevention (Page 26)")
+    print("Expected: Three proposers compete, retries with exponential backoff")
     print("="*70 + "\n")
     
-    threads = [
-        threading.Thread(target=_submit, args=(1, "ValueA", 0.1)),
-        threading.Thread(target=_submit, args=(2, "ValueB", 0.1)),
-        threading.Thread(target=_submit, args=(3, "ValueC", 0.1)),
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
+    _run_concurrent_proposals([
+        (1, "ValueA", 0.1, True),  # enable_retry=True
+        (2, "ValueB", 0.1, True),
+        (3, "ValueC", 0.1, True),
+    ])
     time.sleep(1)
     _show_cluster_state()
 
 
 # ============================================================================
-# COMMAND-LINE INTERFACE
+# Command-Line Interface
 # ============================================================================
 
 SCENARIOS = {
-    "1": run_scenario_single,
-    "single": run_scenario_single,
-    "2": run_scenario_a_wins,
-    "a_wins": run_scenario_a_wins,
-    "3": run_scenario_b_wins_seen,
-    "b_wins_seen": run_scenario_b_wins_seen,
-    "4": run_scenario_b_wins_interleaved,
-    "b_wins_interleaved": run_scenario_b_wins_interleaved,
-    "5": run_scenario_livelock,
-    "livelock": run_scenario_livelock,
-    "state": _show_cluster_state,
-    "reset": _reset_cluster,
+    '1': scenario_1_single,
+    'single': scenario_1_single,
+    '2': scenario_2_a_wins,
+    'a_wins': scenario_2_a_wins,
+    '3': scenario_3_b_sees_a,
+    'b_sees_a': scenario_3_b_sees_a,
+    '4': scenario_4_b_doesnt_see_a,
+    'b_doesnt_see_a': scenario_4_b_doesnt_see_a,
+    '5': scenario_5_livelock,
+    'livelock': scenario_5_livelock,
+    'state': _show_cluster_state,
+    'reset': _reset_cluster,
 }
 
 
-def run_direct_submit(args):
-    """Preserve original direct-submit behavior."""
-    try:
-        node_id = int(args.node_id)
-        if node_id not in PEERS_CONFIG:
-            raise ValueError(f"Node ID not in config: {node_id}")
-    except ValueError as exc:
-        print(f"Invalid node_id: {exc}")
-        sys.exit(1)
-
-    try:
-        delay = float(args.delay) if args.delay is not None else 0.0
-    except ValueError:
-        print("Delay must be numeric.")
-        sys.exit(1)
-
-    _submit(node_id, args.value, delay)
-
-
-def build_parser():
-    """Configure argparse CLI."""
-    parser = argparse.ArgumentParser(description="Paxos test client with scenarios")
-    sub = parser.add_subparsers(dest="command")
-
-    scenario = sub.add_parser("scenario", help="Run a predefined scenario")
-    scenario.add_argument("name", help="Scenario name or number")
-
-    state = sub.add_parser("state", help="Show cluster state")
-    state.set_defaults(command="scenario", name="state")
-
-    submit = sub.add_parser("submit", help="Submit a value directly")
-    submit.add_argument("node_id", help="Target node id (1..N)")
-    submit.add_argument("value", help="Value to propose")
-    submit.add_argument("--delay", help="Optional proposer delay in seconds")
-
-    parser.add_argument("fallback_args", nargs="*", help=argparse.SUPPRESS)
-    return parser
-
-
 def main():
-    parser = build_parser()
-    if len(sys.argv) > 1 and sys.argv[1] not in {"scenario", "state", "submit"}:
-        # Support legacy positional usage: node_id value [delay]
-        legacy_args = sys.argv[1:]
-        if len(legacy_args) < 2:
-            parser.print_help()
-            sys.exit(1)
-        namespace = argparse.Namespace(
-            command="submit",
-            node_id=legacy_args[0],
-            value=legacy_args[1],
-            delay=legacy_args[2] if len(legacy_args) > 2 else None
-        )
-    else:
-        namespace = parser.parse_args()
-        if namespace.command is None:
-            parser.print_help()
-            sys.exit(1)
-
-    if namespace.command == "submit":
-        run_direct_submit(namespace)
-    else:
-        scenario_name = namespace.name.lower()
-        runner = SCENARIOS.get(scenario_name)
-        if runner is None:
-            print("Unknown scenario. Available options:")
-            for key in sorted({k for k in SCENARIOS if not k.isdigit()}):
-                print(f"  - {key}")
-            sys.exit(1)
-        runner()
+    if len(sys.argv) < 2:
+        print("Usage: python3 client.py <scenario>")
+        print("\nAvailable scenarios:")
+        print("  1, single              - Single proposer")
+        print("  2, a_wins              - A wins (Page 23)")
+        print("  3, b_sees_a            - B sees A's value (Page 24)")
+        print("  4, b_doesnt_see_a      - B doesn't see A (Page 25)")
+        print("  5, livelock            - Livelock prevention (Page 26)")
+        print("  state                  - Show cluster state")
+        print("  reset                  - Reset cluster")
+        sys.exit(1)
+    
+    scenario_name = sys.argv[1].lower()
+    scenario_func = SCENARIOS.get(scenario_name)
+    
+    if scenario_func is None:
+        print(f"Unknown scenario: {scenario_name}")
+        print("\nAvailable scenarios:")
+        for key in sorted(set(SCENARIOS.keys())):
+            if not key.isdigit():
+                print(f"  {key}")
+        sys.exit(1)
+    
+    scenario_func()
 
 
 if __name__ == "__main__":
