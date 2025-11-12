@@ -211,70 +211,101 @@ class PaxosNode:  # Encapsulates proposer, acceptor, and learner behavior for on
 
     # --- Proposer RPC Function (Client-facing) ---
 
-
     def rpc_submit_value(self, value, scenario_delay=0):  # Client-facing entry point for proposals
         """
         Client submits a value. This node becomes a Proposer. [cite: 16, 17]
-        This implements the Proposer logic (steps 1, 2, 4, 5, 7).
+        This implements the Proposer logic (steps 1, 2, 4, 5, 7) with retry logic.
+        
+        (Bonus-2) Implements randomized restart for livelock prevention:
+        - If proposal fails, retry with exponential backoff
+        - Random jitter breaks symmetry between competing proposers
         """
 
         # Add a random delay to simulate network/processing differences [cite: 28, 30]
-        # This is key to simulating the different scenarios.
-        print(f"\n[PROPOSER {self.node_id}] Received submit request for '{value}' with delay {scenario_delay}s")  # Log request
+        print(f"\n[PROPOSER {self.node_id}] Received submit request for '{value}' with delay {scenario_delay}s")
         time.sleep(scenario_delay)  # Honor scripted scenario delay
 
-        # (Bonus-2) Add random delay for livelock avoidance [cite: 40]
-        time.sleep(random.uniform(0, 0.1))  # Introduce jitter to break symmetry
+        # (Bonus-2) Retry loop with randomized backoff for livelock prevention
+        MAX_RETRIES = 10
+        MIN_BACKOFF = 0.1
+        MAX_BACKOFF = 5.0
+        
+        for attempt in range(MAX_RETRIES):
+            # (Bonus-2) Randomized delay before each attempt
+            if attempt == 0:
+                # Initial jitter to break symmetry
+                jitter = random.uniform(0, 0.1)
+                time.sleep(jitter)
+                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{MAX_RETRIES} (initial jitter: {jitter:.3f}s)")
+            else:
+                # Exponential backoff with randomization on retry
+                backoff = min(MIN_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
+                backoff_with_jitter = backoff * random.uniform(0.5, 1.5)
+                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{MAX_RETRIES} after {backoff_with_jitter:.3f}s backoff")
+                time.sleep(backoff_with_jitter)
 
-        # --- Step 1: Choose new proposal number n ---
-        with self.lock:  # Protect counter increment
-            self.proposal_counter += 1  # Bump local counter
-            proposal_id = (self.proposal_counter, self.node_id)  # Construct globally unique proposal ID
+            # --- Step 1: Choose new proposal number n ---
+            with self.lock:
+                self.proposal_counter += 1
+                proposal_id = (self.proposal_counter, self.node_id)
 
-        print(f"[PROPOSER {self.node_id}] Starting Phase 1 (PREPARE) with ID {proposal_id}")  # Announce phase start
+            print(f"[PROPOSER {self.node_id}] Starting Phase 1 (PREPARE) with ID {proposal_id}")
 
-        # --- Step 2: Broadcast Prepare(n) to all servers ---
-        responses = self._broadcast_rpc('rpc_prepare', proposal_id)  # Collect acceptor responses
+            # --- Step 2: Broadcast Prepare(n) to all servers ---
+            responses = self._broadcast_rpc('rpc_prepare', proposal_id)
 
-        # --- Step 4: When responses received from majority ---
-        promises = [r for r in responses.values() if r and r.get('status') == 'promise']  # Filter successful promises
+            # --- Step 4: When responses received from majority ---
+            promises = [r for r in responses.values() if r and r.get('status') == 'promise']
 
-        if len(promises) < MAJORITY:  # Abort if quorum not reached
-            print(f"[PROPOSER {self.node_id}] Phase 1 FAILED: Not enough promises ({len(promises)}/{MAJORITY}). Restarting.")  # Log failure
-            return {"status": "fail", "reason": "prepare_rejected", "proposal_id": proposal_id}  # Inform client of failure state
+            if len(promises) < MAJORITY:
+                print(f"[PROPOSER {self.node_id}] Phase 1 FAILED: Not enough promises ({len(promises)}/{MAJORITY}).")
+                if attempt < MAX_RETRIES - 1:
+                    print(f"[PROPOSER {self.node_id}] Will retry with new proposal ID...")
+                    continue  # Retry with new proposal ID
+                else:
+                    print(f"[PROPOSER {self.node_id}] Max retries reached. Giving up.")
+                    return {"status": "fail", "reason": "prepare_rejected", "proposal_id": proposal_id, "attempts": attempt + 1}
 
-        print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: Got {len(promises)} promises.")  # Confirm majority
+            print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: Got {len(promises)} promises.")
 
-        # --- Step 4 logic: Check for accepted values ---
-        highest_accepted_id = (-1, -1)  # Track highest accepted proposal seen
-        value_to_propose = value  # Default to caller's requested value
+            # --- Step 4 logic: Check for accepted values ---
+            highest_accepted_id = (-1, -1)
+            value_to_propose = value
 
-        for res in promises:  # Inspect each promise
-            if res['accepted_id'] > highest_accepted_id:  # Prefer highest prior acceptance
-                highest_accepted_id = res['accepted_id']  # Record better accepted proposal ID
-                value_to_propose = res['accepted_value']  # Adopt previously accepted value
+            for res in promises:
+                if res['accepted_id'] > highest_accepted_id:
+                    highest_accepted_id = res['accepted_id']
+                    value_to_propose = res['accepted_value']
 
-        if value_to_propose != value:  # Check if adoption occurred
-            print(f"[PROPOSER {self.node_id}] Previous value '{value_to_propose}' (ID {highest_accepted_id}) found. Must propose it.")  # Explain change
+            if value_to_propose != value:
+                print(f"[PROPOSER {self.node_id}] Previous value '{value_to_propose}' (ID {highest_accepted_id}) found. Must propose it.")
 
-        # --- Step 5: Broadcast Accept(n, value) to all servers ---
-        print(f"[PROPOSER {self.node_id}] Starting Phase 2 (ACCEPT) with ID {proposal_id} and value '{value_to_propose}'")  # Announce phase 2
-        responses = self._broadcast_rpc('rpc_accept', proposal_id, value_to_propose)  # Ask acceptors to accept
+            # --- Step 5: Broadcast Accept(n, value) to all servers ---
+            print(f"[PROPOSER {self.node_id}] Starting Phase 2 (ACCEPT) with ID {proposal_id} and value '{value_to_propose}'")
+            responses = self._broadcast_rpc('rpc_accept', proposal_id, value_to_propose)
 
-        # --- Step 7: When responses received from majority ---
-        accepts = [r for r in responses.values() if r and r.get('status') == 'accepted']  # Count acceptances
+            # --- Step 7: When responses received from majority ---
+            accepts = [r for r in responses.values() if r and r.get('status') == 'accepted']
 
-        if len(accepts) < MAJORITY:  # Insufficient quorum
-            print(f"[PROPOSER {self.node_id}] Phase 2 FAILED: Not enough accepts ({len(accepts)}/{MAJORITY}).")  # Log failure
-            return {"status": "fail", "reason": "accept_rejected", "proposal_id": proposal_id}  # Return failure payload
+            if len(accepts) < MAJORITY:
+                print(f"[PROPOSER {self.node_id}] Phase 2 FAILED: Not enough accepts ({len(accepts)}/{MAJORITY}).")
+                if attempt < MAX_RETRIES - 1:
+                    print(f"[PROPOSER {self.node_id}] Will retry with new proposal ID...")
+                    continue  # Retry with new proposal ID
+                else:
+                    print(f"[PROPOSER {self.node_id}] Max retries reached. Giving up.")
+                    return {"status": "fail", "reason": "accept_rejected", "proposal_id": proposal_id, "attempts": attempt + 1}
 
-        # --- SUCCESS! Value is chosen ---
-        print(f"[PROPOSER {self.node_id}] Phase 2 SUCCESS: Value '{value_to_propose}' is CHOSEN.")  # Celebrate success
+            # --- SUCCESS! Value is chosen ---
+            print(f"[PROPOSER {self.node_id}] Phase 2 SUCCESS: Value '{value_to_propose}' is CHOSEN after {attempt + 1} attempt(s).")
 
-        # Inform all nodes (acting as Learners) of the final value
-        self._broadcast_rpc('rpc_learn_chosen_value', value_to_propose)  # Disseminate chosen value
+            # Inform all nodes (acting as Learners) of the final value
+            self._broadcast_rpc('rpc_learn_chosen_value', value_to_propose)
 
-        return {"status": "success", "value": value_to_propose}  # Notify client of successful consensus
+            return {"status": "success", "value": value_to_propose, "attempts": attempt + 1}
+
+        # Should never reach here, but just in case
+        return {"status": "fail", "reason": "max_retries_exceeded", "attempts": MAX_RETRIES}
 
     def rpc_learn_chosen_value(self, value):  # Learner hook invoked once consensus succeeds
         """
