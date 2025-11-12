@@ -186,7 +186,31 @@ class PaxosNode:  # Encapsulates proposer, acceptor, and learner behavior for on
         with self.lock:  # Ensure consistent read of learner state
             return self.chosen_value  # Return locally learned value (could be None)
 
+    def rpc_reset_state(self):  # Reset node to initial state for testing
+        """Reset this node to initial state (for testing scenarios)."""
+        with self.lock:
+            print(f"[RESET] Node {self.node_id} resetting state...")
+            
+            # Reset Paxos state
+            self.promised_id = (-1, -1)
+            self.accepted_id = (-1, -1)
+            self.accepted_value = None
+            self.proposal_counter = 0
+            self.chosen_value = None
+            
+            # Clear storage files
+            try:
+                with open(self.storage_file, 'w') as f:
+                    f.write("")
+                self._persist_acceptor_state()
+                print(f"[RESET] Node {self.node_id} state cleared successfully")
+                return {"status": "success"}
+            except Exception as e:
+                print(f"[RESET ERROR] Node {self.node_id}: {e}")
+                return {"status": "error", "message": str(e)}
+
     # --- Proposer RPC Function (Client-facing) ---
+
 
     def rpc_submit_value(self, value, scenario_delay=0):  # Client-facing entry point for proposals
         """
@@ -316,6 +340,7 @@ def main():
     handler.register_function(node.rpc_submit_value)  # Expose proposer entry point
     handler.register_function(node.rpc_get_file_content)  # Expose file read helper
     handler.register_function(node.rpc_learn_chosen_value)  # Expose learner notification
+    handler.register_function(node.rpc_reset_state)  # Expose reset for testing
 
     # Start the RPC server
     try:

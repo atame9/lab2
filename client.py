@@ -51,7 +51,31 @@ def _show_cluster_state():  # Print current learner values for all nodes
     print("=====================\n")
 
 
+def _reset_node(node_id):  # Reset a single node's state
+    """Reset a single node to initial state."""
+    proxy, conn = _connect(node_id)
+    try:
+        result = proxy.rpc_reset_state()
+        print(f"Node {node_id} reset: {result.get('status', 'unknown')}")
+        return result
+    finally:
+        conn.close()
+
+
+def _reset_cluster():  # Reset all nodes to fresh state
+    """Reset all nodes to fresh state for testing."""
+    print("\n=== Resetting cluster state ===")
+    for node_id in sorted(PEERS_CONFIG):
+        try:
+            _reset_node(node_id)
+        except Exception as e:
+            print(f"Error resetting Node {node_id}: {e}")
+    print("=== Reset complete ===\n")
+    time.sleep(0.5)  # Give nodes a moment to stabilize
+
+
 def run_scenario_single():  # Scenario 1 from reference client
+    _reset_cluster()  # Reset before running
     print("\nScenario 1: Single proposer\n")
     _submit(1, "ValueA", 0.0)
     time.sleep(1)
@@ -59,6 +83,7 @@ def run_scenario_single():  # Scenario 1 from reference client
 
 
 def run_scenario_a_wins():  # Scenario 2
+    _reset_cluster()  # Reset before running
     print("\nScenario 2: Two proposers, A wins\n")
     _submit(1, "ValueA", 0.0)
     time.sleep(0.5)
@@ -68,6 +93,7 @@ def run_scenario_a_wins():  # Scenario 2
 
 
 def run_scenario_b_wins_seen():  # Scenario 3
+    _reset_cluster()  # Reset before running
     print("\nScenario 3: Two proposers, B wins (A delayed)\n")
 
     threads = [
@@ -83,6 +109,7 @@ def run_scenario_b_wins_seen():  # Scenario 3
 
 
 def run_scenario_b_wins_interleaved():  # Scenario 4
+    _reset_cluster()  # Reset before running
     print("\nScenario 4: Two proposers, interleaved\n")
     threads = [
         threading.Thread(target=_submit, args=(1, "ValueA", 0.15)),
@@ -97,6 +124,7 @@ def run_scenario_b_wins_interleaved():  # Scenario 4
 
 
 def run_scenario_livelock():  # Scenario 5
+    _reset_cluster()  # Reset before running
     print("\nScenario 5: Three proposers (livelock stress)\n")
     threads = [
         threading.Thread(target=_submit, args=(1, "ValueA", 0.1)),
@@ -123,6 +151,7 @@ SCENARIOS = {  # Mapping of scenario identifiers to runner functions
     "5": run_scenario_livelock,
     "livelock": run_scenario_livelock,
     "state": _show_cluster_state,
+    "reset": _reset_cluster,  # Add reset command
 }
 
 
