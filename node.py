@@ -4,8 +4,7 @@ import json  # For serializing/deserializing state to/from disk
 import os  # For file system operations (checking file existence)
 import sys  # For command-line argument parsing
 import threading  # For concurrent operations and lock-based synchronization
-import time  # For delays and backoff timing
-import random  # For randomized backoff to prevent livelock
+import time  # For delays in test scenarios
 from multiprocessing.connection import Client  # For establishing RPC connections
 import rpc_tools  # Custom RPC utilities for remote procedure calls
 
@@ -17,11 +16,6 @@ PEERS_CONFIG = {
 }
 AUTHKEY = b'paxos_lab_secret'  # Shared secret for authenticated connections
 MAJORITY = len(PEERS_CONFIG) // 2 + 1  # 2 out of 3 nodes required for consensus
-
-# Retry configuration for livelock prevention (Bonus-2)
-MAX_RETRIES = 10       # Maximum number of retry attempts before giving up
-MIN_BACKOFF = 0.1      # Minimum backoff time in seconds (100ms)
-MAX_BACKOFF = 5.0      # Maximum backoff time in seconds (5s cap)
 
 
 class PaxosNode:
@@ -282,136 +276,98 @@ class PaxosNode:
     # Proposer RPC (Main Entry Point)
     # ========================================================================
 
-    def rpc_submit_value(self, value, scenario_delay=0, enable_retry=False, inter_phase_delay=0.0, phase2_accept_delays=None):
-        """
-        Proposer entry point: propose a value using Paxos consensus.
+    def rpc_submit_value(self, value, scenario_delay=0, phase2_accept_delays=None):
+        """Proposer entry point: propose a value using Paxos consensus.
         
         Args:
-            value: Value to propose
-            scenario_delay: Initial delay (for test scenarios)
-            enable_retry: If True, retry on failure with exponential backoff (Bonus-2)
-            inter_phase_delay: Delay between Phase 1 and Phase 2 (for testing interleaving)
-            phase2_accept_delays: Dict {node_id: delay} for Phase 2 ACCEPT message delays
+            value: The value this proposer wants to propose
+            scenario_delay: Initial delay before starting (for test scenarios)
+            phase2_accept_delays: Dict {node_id: delay} for simulating network delays
         """
+        # Log the proposal request from the client
         print(f"\n[PROPOSER {self.node_id}] Submit request: '{value}' (delay {scenario_delay}s)")
         
-        # Honor test scenario delay before starting consensus
+        # Honor the test scenario delay before starting consensus
         time.sleep(scenario_delay)
 
-        # Determine maximum attempts based on retry flag
-        max_attempts = MAX_RETRIES if enable_retry else 1
+        # Attempt one round of Paxos consensus
+        result = self._try_consensus(value, phase2_accept_delays)
         
-        # Attempt consensus with retries if enabled
-        for attempt in range(max_attempts):
-            # Apply jitter and backoff for livelock prevention
-            if attempt == 0:
-                # Initial jitter to break symmetry between competing proposers
-                jitter = random.uniform(0, 0.1)  # Random 0-100ms delay
-                time.sleep(jitter)
-                if enable_retry:
-                    print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{max_attempts} (jitter: {jitter:.3f}s)")
-            else:
-                # Exponential backoff: doubles each time up to MAX_BACKOFF
-                backoff = min(MIN_BACKOFF * (2 ** (attempt - 1)), MAX_BACKOFF)
-                
-                # Add randomness to backoff to avoid synchronization
-                backoff *= random.uniform(0.5, 1.5)
-                print(f"[PROPOSER {self.node_id}] Attempt {attempt + 1}/{max_attempts} (backoff: {backoff:.3f}s)")
-                time.sleep(backoff)
+        # Return the result (success or failure)
+        return result
 
-            # Attempt one complete round of Paxos consensus
-            result = self._try_consensus(value, enable_retry, inter_phase_delay, phase2_accept_delays)
-            
-            # If consensus succeeded, return immediately
-            if result["status"] == "success":
-                if enable_retry:
-                    result["attempts"] = attempt + 1  # Include number of attempts
-                return result
-            
-            # Retry if enabled and not on last attempt
-            if enable_retry and attempt < max_attempts - 1:
-                print(f"[PROPOSER {self.node_id}] Will retry...")
-            else:
-                # Give up and return failure
-                return result
-        
-        # Should not reach here, but return failure if we do
-        return {"status": "fail", "reason": "max_retries_exceeded"}
-
-    def _try_consensus(self, value, enable_retry, inter_phase_delay=0.0, phase2_accept_delays=None):
+    def _try_consensus(self, value, phase2_accept_delays=None):
         """Attempt one round of Paxos consensus.
         
         Args:
-            phase2_accept_delays: Dict mapping node_id to delay in seconds for Phase 2 ACCEPT.
-                                 If a node is not in the dict, it gets the message immediately.
-                                 Example: {1: 0.1, 2: 0.1} delays Phase 2 to nodes 1 and 2
+            value: The value this proposer wants to propose
+            phase2_accept_delays: Optional dict {node_id: delay} for network simulation
         """
-        # Generate new unique proposal ID: (counter, node_id)
-        # The tuple ensures uniqueness and total ordering
-        with self.lock:
-            self.proposal_counter += 1
-            proposal_id = (self.proposal_counter, self.node_id)
+        # ===== Generate Unique Proposal ID =====
+        with self.lock:  # Lock to ensure atomic counter increment
+            self.proposal_counter += 1  # Increment to get next proposal number
+            proposal_id = (self.proposal_counter, self.node_id)  # (counter, node_id) ensures uniqueness
         
+        # ===== PHASE 1: PREPARE =====
         print(f"[PROPOSER {self.node_id}] Phase 1 PREPARE: {proposal_id}")
         
-        # Phase 1: PREPARE - ask all acceptors to promise not to accept lower proposals
+        # Broadcast PREPARE to all acceptors asking them to promise
         responses = self._broadcast_rpc('rpc_prepare', proposal_id)
         
-        # Count how many acceptors sent back promises
+        # Count how many acceptors sent back promises (not rejections)
         promises = [r for r in responses.values() if r and r.get('status') == 'promise']
         
-        # Check if we achieved majority (required for safety)
+        # Check if we got majority - if not, this proposal fails
         if len(promises) < MAJORITY:
             print(f"[PROPOSER {self.node_id}] Phase 1 FAILED: {len(promises)}/{MAJORITY} promises")
             return {"status": "fail", "reason": "prepare_rejected", "proposal_id": proposal_id}
         
+        # We got majority! Phase 1 succeeded
         print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: {len(promises)} promises")
         
-        # Add delay between Phase 1 and Phase 2 if specified (for testing interleaving)
-        if inter_phase_delay > 0:
-            time.sleep(inter_phase_delay)
+        # ===== VALUE ADOPTION (Paxos Safety) =====
+        value_to_propose = value  # Start with our originally requested value
+        highest_accepted_id = (-1, -1)  # Track the highest proposal ID we've seen
         
-        # Adopt the highest accepted value if any (CRITICAL for safety)
-        value_to_propose = value  # Start with our original value
-        highest_accepted_id = (-1, -1)  # Track highest accepted proposal we've seen
-        
-        # Examine all promise responses for previously accepted values
+        # Look through all promise responses for previously accepted values
         for res in promises:
-            # If this acceptor has accepted a value, check if it's the highest
+            # If this acceptor previously accepted a value with higher ID, we must adopt it
             if res['accepted_id'] > highest_accepted_id:
-                highest_accepted_id = res['accepted_id']
-                # MUST propose this value instead of our original (Paxos safety)
-                value_to_propose = res['accepted_value']
+                highest_accepted_id = res['accepted_id']  # Update highest ID seen
+                value_to_propose = res['accepted_value']  # MUST use this value (Paxos safety!)
         
-        # Log if we're adopting a different value than originally requested
+        # If we're adopting a different value than originally requested, log it
         if value_to_propose != value:
             print(f"[PROPOSER {self.node_id}] Adopting value '{value_to_propose}' from {highest_accepted_id}")
         
-        # Phase 2: ACCEPT - ask all acceptors to accept our chosen value
+        # ===== PHASE 2: ACCEPT =====
         print(f"[PROPOSER {self.node_id}] Phase 2 ACCEPT: {proposal_id} = '{value_to_propose}'")
         
-        # Handle delayed Phase 2 ACCEPT messages if specified
+        # Broadcast ACCEPT message with our chosen value
         if phase2_accept_delays:
+            # Use delayed broadcast if network simulation is enabled
             responses = self._broadcast_rpc_with_delays('rpc_accept', phase2_accept_delays, proposal_id, value_to_propose)
         else:
+            # Normal broadcast - all nodes get message immediately
             responses = self._broadcast_rpc('rpc_accept', proposal_id, value_to_propose)
         
         # Count how many acceptors accepted our proposal
         accepts = [r for r in responses.values() if r and r.get('status') == 'accepted']
         
-        # Check if we achieved majority acceptance (required for safety)
+        # Check if we achieved majority acceptance - if not, this proposal fails
         if len(accepts) < MAJORITY:
             print(f"[PROPOSER {self.node_id}] Phase 2 FAILED: {len(accepts)}/{MAJORITY} accepts")
             return {"status": "fail", "reason": "accept_rejected", "proposal_id": proposal_id}
         
-        # Success! The value is now chosen by consensus
+        # ===== CONSENSUS ACHIEVED =====
+        # We got majority accepts - the value is now chosen!
         print(f"[PROPOSER {self.node_id}] Phase 2 SUCCESS: '{value_to_propose}' is CHOSEN")
         
-        # Notify all nodes that value is chosen so they can write to file
-        # This ensures writes only happen after consensus is reached
+        # Notify all nodes that consensus is reached so they can write to file
         print(f"[PROPOSER {self.node_id}] Notifying all nodes that value is chosen...")
         self._broadcast_rpc('rpc_value_chosen', proposal_id, value_to_propose)
         
+        # Return success with the chosen value
         return {"status": "success", "value": value_to_propose}
 
     # ========================================================================

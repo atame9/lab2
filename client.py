@@ -37,13 +37,20 @@ def _rpc_call(node_id, method_name, *args):
         conn.close()
 
 
-def _submit(node_id, value, delay, enable_retry=False, inter_phase_delay=0.0, phase2_accept_delays=None):
-    """Submit a value proposal to a node."""
+def _submit(node_id, value, delay, phase2_accept_delays=None):
+    """Submit a value proposal to a node.
+    
+    Args:
+        node_id: ID of the node to submit to (1, 2, or 3)
+        value: The value to propose
+        delay: Initial delay in seconds before starting proposal
+        phase2_accept_delays: Optional dict for network delay simulation
+    """
     # Print submission details for user visibility
     print(f"Submitting '{value}' to Node {node_id} (delay {delay}s)")
     
     # Make RPC call to node's submit_value method with all parameters
-    result = _rpc_call(node_id, 'rpc_submit_value', value, delay, enable_retry, inter_phase_delay, phase2_accept_delays)
+    result = _rpc_call(node_id, 'rpc_submit_value', value, delay, phase2_accept_delays)
     
     # Display the result (success/failure) from the proposer
     print(f" -> {result}")
@@ -104,8 +111,8 @@ def _run_concurrent_proposals(proposals):
 # ============================================================================
 
 def scenario_1_single():
-    """Single proposer with no contention."""
-    # Start fresh by resetting all nodes
+    """Scenario 1: Single proposer with no contention."""
+    # Reset all nodes to clean state
     _reset_cluster()
     
     # Display scenario description
@@ -115,7 +122,7 @@ def scenario_1_single():
     print("="*70 + "\n")
     
     # Submit single proposal to Node 1 with no delay
-    _submit(1, "ValueA", 0.0)
+    _submit(node_id=1, value="ValueA", delay=0.0)
     
     # Wait for consensus to complete
     time.sleep(1)
@@ -125,8 +132,8 @@ def scenario_1_single():
 
 
 def scenario_2_a_wins():
-    """Sequential proposals where first proposer completes before second starts."""
-    # Start fresh by resetting all nodes
+    """Scenario 2: Sequential proposals where first proposer completes before second starts."""
+    # Reset all nodes to clean state
     _reset_cluster()
     
     # Display scenario description (references Paxos paper page 23)
@@ -136,13 +143,13 @@ def scenario_2_a_wins():
     print("="*70 + "\n")
     
     # First proposal starts and completes
-    _submit(1, "ValueA", 0.0)
+    _submit(node_id=1, value="ValueA", delay=0.0)
     
     # Wait for ValueA to be chosen before starting second proposal
     time.sleep(0.5)
     
     # Second proposal should see ValueA was already chosen and adopt it
-    _submit(2, "ValueB", 0.0)
+    _submit(node_id=2, value="ValueB", delay=0.0)
     
     # Wait for second proposal to complete
     time.sleep(1)
@@ -152,8 +159,8 @@ def scenario_2_a_wins():
 
 
 def scenario_3_b_sees_a():
-    """Overlapping proposals where second proposer sees first's value."""
-    # Start fresh by resetting all nodes
+    """Scenario 3: Value accepted but not yet chosen when second proposer prepares."""
+    # Reset all nodes to clean state
     _reset_cluster()
     
     # Display scenario description (references Paxos paper page 24)
@@ -163,20 +170,22 @@ def scenario_3_b_sees_a():
     print("          Node 2 prepares after Node 3 accepts, sees the value")
     print("="*70 + "\n")
     
-    # Recreate the screenshot scenario:
-    # - Node 1 (acting as S3 in diagram): Proposes ValueA
-    #   - Phase 1 completes on all nodes
-    #   - Phase 2 ACCEPT is delayed to Nodes 1 & 2 (simulate network delay)
-    #   - Phase 2 ACCEPT reaches Node 3 immediately
-    # - Node 2 (acting as S5 in diagram): Proposes ValueB after Node 3 accepts
+    # Recreate the screenshot scenario with network delay simulation:
+    # - Node 1 proposes ValueA (acting as S3 in diagram)
+    #   - Phase 1 completes on all nodes (all promise)
+    #   - Phase 2 ACCEPT delayed 100ms to Nodes 1 & 2 (simulates slow network)
+    #   - Phase 2 ACCEPT reaches Node 3 immediately (simulates fast local network)
+    #   - Result: Only Node 3 accepts initially (1/3, no quorum yet)
+    # - Node 2 proposes ValueB after Node 3 accepts (acting as S5 in diagram)
     #   - Sees Node 3's accepted value and adopts it
+    #   - Both proposals succeed with ValueA
     
     _run_concurrent_proposals([
-        # Node 1: Delay Phase 2 to nodes 1 & 2, so only node 3 accepts immediately
-        (1, "ValueA", 0.0, False, 0.0, {1: 0.1, 2: 0.1}),
+        # Node 1: Delay Phase 2 ACCEPT to nodes 1 & 2 by 100ms, node 3 gets it immediately
+        (1, "ValueA", 0.0, {1: 0.1, 2: 0.1}),
         
-        # Node 2: Starts after node 3 has accepted, will see the accepted value
-        (2, "ValueB", 0.03, False, 0.0, None),
+        # Node 2: Starts 30ms later (after node 3 has accepted), will see the accepted value
+        (2, "ValueB", 0.03, None),
     ])
     
     # Wait for both proposals to complete
@@ -187,51 +196,27 @@ def scenario_3_b_sees_a():
 
 
 def scenario_4_b_doesnt_see_a():
-    """True interleaving where second proposer doesn't see first's value."""
-    # Start fresh by resetting all nodes
+    """Scenario 4: True interleaving where second proposer doesn't see first's value."""
+    # Reset all nodes to clean state
     _reset_cluster()
     
     # Display scenario description (references Paxos paper page 25)
     print("\n" + "="*70)
-    print("SCENARIO 4: B Wins (Page 25 - Previous value not chosen, B doesn't see it)")
-    print("Expected: True interleaving, B proposes its own value")
+    print("SCENARIO 4: B Doesn't See A (Page 25 - True interleaving)")
+    print("Expected: Both proposals start nearly simultaneously")
     print("="*70 + "\n")
     
     # Run proposals concurrently with very close timing
+    # Result depends on exact interleaving - one will win based on timing
     _run_concurrent_proposals([
-        (1, "ValueA", 0.01, False),  # Very close timing (10ms delay)
-        (2, "ValueB", 0.0, False),   # B starts slightly first (no delay)
+        (1, "ValueA", 0.01, None),  # Node 1 starts with 10ms delay
+        (2, "ValueB", 0.0, None),   # Node 2 starts immediately (slightly first)
     ])
     
     # Wait for both proposals to complete
     time.sleep(1)
     
     # Show final state (winner depends on exact timing and interleaving)
-    _show_cluster_state()
-
-
-def scenario_5_livelock():
-    """Multiple competing proposers with retry to prevent livelock."""
-    # Start fresh by resetting all nodes
-    _reset_cluster()
-    
-    # Display scenario description (references Paxos paper page 26)
-    print("\n" + "="*70)
-    print("SCENARIO 5: Livelock Prevention (Page 26)")
-    print("Expected: Three proposers compete, retries with exponential backoff")
-    print("="*70 + "\n")
-    
-    # Run three concurrent proposals, all with retry enabled
-    _run_concurrent_proposals([
-        (1, "ValueA", 0.1, True),  # enable_retry=True for livelock prevention
-        (2, "ValueB", 0.1, True),  # enable_retry=True for livelock prevention
-        (3, "ValueC", 0.1, True),  # enable_retry=True for livelock prevention
-    ])
-    
-    # Wait for proposals to complete (may take longer due to retries)
-    time.sleep(1)
-    
-    # Show final state (one value should win after retries)
     _show_cluster_state()
 
 
@@ -249,8 +234,6 @@ SCENARIOS = {
     'b_sees_a': scenario_3_b_sees_a,
     '4': scenario_4_b_doesnt_see_a,
     'b_doesnt_see_a': scenario_4_b_doesnt_see_a,
-    '5': scenario_5_livelock,
-    'livelock': scenario_5_livelock,
     'state': _show_cluster_state,
     'reset': _reset_cluster,
 }
@@ -266,7 +249,6 @@ def main():
         print("  2, a_wins              - A wins (Page 23)")
         print("  3, b_sees_a            - B sees A's value (Page 24)")
         print("  4, b_doesnt_see_a      - B doesn't see A (Page 25)")
-        print("  5, livelock            - Livelock prevention (Page 26)")
         print("  state                  - Show cluster state")
         print("  reset                  - Reset cluster")
         sys.exit(1)
