@@ -37,7 +37,7 @@ def _rpc_call(node_id, method_name, *args):
         conn.close()
 
 
-def _submit(node_id, value, delay, phase2_accept_delays=None):
+def _submit(node_id, value, delay, phase2_accept_delays=None, inter_phase_delay=0):
     """Submit a value proposal to a node.
     
     Args:
@@ -45,12 +45,13 @@ def _submit(node_id, value, delay, phase2_accept_delays=None):
         value: The value to propose
         delay: Initial delay in seconds before starting proposal
         phase2_accept_delays: Optional dict for network delay simulation
+        inter_phase_delay: Optional delay between Phase 1 and Phase 2
     """
     # Print submission details for user visibility
     print(f"Submitting '{value}' to Node {node_id} (delay {delay}s)")
     
     # Make RPC call to node's submit_value method with all parameters
-    result = _rpc_call(node_id, 'rpc_submit_value', value, delay, phase2_accept_delays)
+    result = _rpc_call(node_id, 'rpc_submit_value', value, delay, phase2_accept_delays, inter_phase_delay)
     
     # Display the result (success/failure) from the proposer
     print(f" -> {result}")
@@ -196,27 +197,43 @@ def scenario_3_b_sees_a():
 
 
 def scenario_4_b_doesnt_see_a():
-    """Scenario 4: True interleaving where second proposer doesn't see first's value."""
+    """Scenario 4: New proposer doesn't see previous value and chooses its own."""
     # Reset all nodes to clean state
     _reset_cluster()
     
     # Display scenario description (references Paxos paper page 25)
     print("\n" + "="*70)
-    print("SCENARIO 4: B Doesn't See A (Page 25 - True interleaving)")
-    print("Expected: Both proposals start nearly simultaneously")
+    print("SCENARIO 4: B Doesn't See A (Page 25 - New proposer chooses own value)")
+    print("Expected: Node 1 Phase 1 completes, then WAITS before Phase 2")
+    print("          Node 2 prepares during the wait, sees NO accepted values")
+    print("          Node 2 proposes its own value Y and wins")
     print("="*70 + "\n")
     
-    # Run proposals concurrently with very close timing
-    # Result depends on exact interleaving - one will win based on timing
+    # Recreate the screenshot scenario:
+    # - Node 1 proposes ValueA (acting as S1 in diagram)
+    #   - Phase 1 completes on all nodes (S1, S2, S3 all promise to 3.1)
+    #   - WAITS 50ms before starting Phase 2 (inter-phase delay)
+    #   - During wait, NO nodes have accepted yet!
+    # - Node 2 proposes ValueB (acting as S5 in diagram)
+    #   - Starts during Node 1's wait (at 30ms)
+    #   - Sends PREPARE (4.5) to all nodes
+    #   - ALL nodes return promises with NO accepted value
+    #   - Node 2 proposes its own value Y
+    #   - Gets majority, Y is chosen
+    #   - When Node 1's Phase 2 finally starts, it's blocked (higher proposal promised)
+    
     _run_concurrent_proposals([
-        (1, "ValueA", 0.01, None),  # Node 1 starts with 10ms delay
-        (2, "ValueB", 0.0, None),   # Node 2 starts immediately (slightly first)
+        # Node 1: 50ms delay between Phase 1 and Phase 2, giving Node 2 time to prepare
+        (1, "ValueA", 0.0, None, 0.05),
+        
+        # Node 2: Starts 30ms later (during Node 1's inter-phase delay)
+        (2, "ValueB", 0.03, None, 0.0),
     ])
     
     # Wait for both proposals to complete
     time.sleep(1)
     
-    # Show final state (winner depends on exact timing and interleaving)
+    # Show final state (all nodes should have ValueB - Y wins!)
     _show_cluster_state()
 
 

@@ -276,13 +276,14 @@ class PaxosNode:
     # Proposer RPC (Main Entry Point)
     # ========================================================================
 
-    def rpc_submit_value(self, value, scenario_delay=0, phase2_accept_delays=None):
+    def rpc_submit_value(self, value, scenario_delay=0, phase2_accept_delays=None, inter_phase_delay=0):
         """Proposer entry point: propose a value using Paxos consensus.
         
         Args:
             value: The value this proposer wants to propose
             scenario_delay: Initial delay before starting (for test scenarios)
             phase2_accept_delays: Dict {node_id: delay} for simulating network delays
+            inter_phase_delay: Delay between Phase 1 and Phase 2 (for scenario 4 timing)
         """
         # Log the proposal request from the client
         print(f"\n[PROPOSER {self.node_id}] Submit request: '{value}' (delay {scenario_delay}s)")
@@ -291,17 +292,18 @@ class PaxosNode:
         time.sleep(scenario_delay)
 
         # Attempt one round of Paxos consensus
-        result = self._try_consensus(value, phase2_accept_delays)
+        result = self._try_consensus(value, phase2_accept_delays, inter_phase_delay)
         
         # Return the result (success or failure)
         return result
 
-    def _try_consensus(self, value, phase2_accept_delays=None):
+    def _try_consensus(self, value, phase2_accept_delays=None, inter_phase_delay=0):
         """Attempt one round of Paxos consensus.
         
         Args:
             value: The value this proposer wants to propose
             phase2_accept_delays: Optional dict {node_id: delay} for network simulation
+            inter_phase_delay: Optional delay between Phase 1 and Phase 2 (for scenario 4)
         """
         # ===== Generate Unique Proposal ID =====
         with self.lock:  # Lock to ensure atomic counter increment
@@ -324,6 +326,10 @@ class PaxosNode:
         
         # We got majority! Phase 1 succeeded
         print(f"[PROPOSER {self.node_id}] Phase 1 SUCCESS: {len(promises)} promises")
+        
+        # Optional delay between Phase 1 and Phase 2 (for scenario 4 timing)
+        if inter_phase_delay > 0:
+            time.sleep(inter_phase_delay)
         
         # ===== VALUE ADOPTION (Paxos Safety) =====
         value_to_propose = value  # Start with our originally requested value
